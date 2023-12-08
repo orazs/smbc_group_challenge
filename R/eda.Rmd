@@ -1,0 +1,139 @@
+
+
+Predicting the health of trees is extremely important in urban greening and forest protection efforts.
+Participants will take on the challenge of predicting the health status of trees by building analytical models based on quantitative and qualitative data such as tree size, potential problems, and surrounding environment.
+Unhealthy trees pose a variety of problems to cities and communities. These include a decline in urban aesthetics, reduced capacity to adapt to climate change, and loss of biodiversity. Additionally, it should be considered that unhealthy trees have a high risk of falling, which could cause damage to people's lives and property. Environmental agencies and city managers use methods such as periodic monitoring, public education, implementation of advanced monitoring systems, and early response measures to predict and manage tree health.
+
+
+
+
+
+```{r }
+library(tidyverse)
+library(tidymodels)
+library(embed)
+library(themis)
+train <- read.csv("../data/train.csv")
+desc <- read.csv("../data/desc.csv")
+
+
+
+train$health <- as.factor(train$health)
+train[train==""] <- "NotDefined"
+
+
+train <- train %>% 
+  mutate(across(!tree_dbh & !health, as.character))
+
+
+
+st_split <- initial_split(train,prop = 0.8)
+train_data <- training(st_split)
+test_data <- testing(st_split)
+
+
+folds <- vfold_cv(train_data, v = 5)
+
+results <- train %>%
+  dplyr::select(-created_at) %>%
+  names() %>% map_dfr(function(x){
+    chi_value <- chisq.test(train$health, train[[x]])
+    data.frame(x, chi_value=chi_value$p.value)
+  }) %>%
+  arrange(chi_value) %>%
+  filter(chi_value>0.05)
+
+
+xg_model <- boost_tree(mtry = tune(),trees = tune(),tree_depth = tune())%>%
+  set_engine("xgboost")%>%
+  set_mode("classification")
+
+
+base_recipe <- recipe(health~.,train) %>%
+  step_rm(created_at,X,boro_ct,-zip_city,st_senate,curb_loc,sidewalk,borocode,boroname) %>%
+  step_other(all_nominal_predictors())%>%
+  step_interact(terms= ~zip_city:tree_dbh,sep=':') %>%
+  step_dummy(all_nominal_predictors(),one_hot = T)
+
+dummy_df <- base_recipe %>% prep %>% bake(new_data = NULL)
+  
+
+wf_set <- workflow_set(preproc = list("base_recipe"=base_recipe),
+             models  = list(xg_model),
+             cross = TRUE)
+
+library(doParallel)
+registerDoParallel(cores=4)
+
+cl_metrics = metric_set(yardstick::accuracy,yardstick::f_meas,yardstick::precision, yardstick::recall)
+
+tune_wf <- wf_set %>%
+  workflow_map(fn = "tune_grid",
+               resamples=folds,
+               grid=10,
+               metrics=cl_metrics)
+
+
+tune_wf %>% autoplot()
+
+
+tune_wf %>%
+  rank_results(rank_metric = "f_meas") %>%
+  filter(.metric == "f_meas",wflow_id=="base_recipe_boost_tree")
+
+best_wf <- tune_wf %>%
+  extract_workflow_set_result("base_recipe_boost_tree") %>%
+  select_best(metric = "f_meas")
+
+
+wf_final <- tune_wf %>%
+  extract_workflow("base_recipe_boost_tree") %>%
+  finalize_workflow(best_wf) %>%
+  fit(train_data)
+
+
+
+
+preds <- predict(wf_final, test_data)
+
+test_data$health_predicted <- preds$.pred_class
+
+f_meas(test_data,health,health_predicted)
+
+test_data%>%
+  group_by(health_predicted)%>%
+  summarise(n=n())
+
+vip::vi(wf_final$fit$fit) %>% ggplot(aes(reorder(Variable, Importance), Importance)) +
+  geom_col() +
+  coord_flip()
+
+
+autoplot(tune_wf, id = "base_recipe_boost_tree", metric = "f_meas")
+
+
+table('real'=test_data$health,'predicted'=test_data$health_predicted)
+
+
+```
+
+
+```{r}
+test <- read.csv("data/test.csv")
+test[test==""] <- "NotDefined"
+test <- test %>% 
+  mutate(across(!tree_dbh , as.character))
+
+preds <- predict(wf_final, test)
+
+test$healph <- preds$.pred_class
+
+#submission
+test %>%
+  dplyr::select(X,healph) %>%
+  write.csv("data/submission.csv",row.names = FALSE,quote = FALSE)
+
+
+saveRDS(wf_final,"wflows/wf_final2.RData")
+```
+
